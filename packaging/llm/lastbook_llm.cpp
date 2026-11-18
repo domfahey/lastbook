@@ -2,6 +2,7 @@
 // one JSON object per line, and never opens a socket, a port or a web address. It reads one file, the model it is given.
 //
 //   lastbook-llm --model FILE [--ctx N] [--threads N] [--cpu-only] [--measure]
+//   lastbook-llm --embed --model FILE [--dim D]      an embedding model: see embed() below
 //
 // On start it fits the model to this computer's memory with llama.cpp's own fitting (common/fit.cpp, the same as llama-server's
 // default --fit), prints {"ev":"fit",...} with what it measured, then loads the model and prints {"ev":"ready",...}.
@@ -25,6 +26,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -338,6 +340,101 @@ static void generate(Engine & e, const json & req) {
     send(done);
 }
 
+// ------------------------------------------------------------------------------------------------------------ embeddings --
+static std::string base64(const void * data, size_t n) {
+    static const char * T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const unsigned char * p = (const unsigned char *) data;
+    std::string out;
+    out.reserve((n + 2) / 3 * 4);
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t) p[i] << 16 | (i + 1 < n ? (uint32_t) p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+        out += T[v >> 18 & 63];
+        out += T[v >> 12 & 63];
+        out += i + 1 < n ? T[v >> 6 & 63] : '=';
+        out += i + 2 < n ? T[v & 63] : '=';
+    }
+    return out;
+}
+
+// {"op":"embed","id":1,"texts":["...",...],"max_tokens":512} -> {"ev":"vec","id":1,"dim":D,"n":N,"b64":"<N*D float32, little-endian>"}
+// Each vector is the model's pooled output cut to the first D numbers (Matryoshka) and scaled to length 1. The texts carry
+// their own task prompts: the app adds them, this program does not.
+static void embed(Engine & e, const json & req, int dim) {
+    const json id = req.value("id", json());
+    const json texts = req.value("texts", json::array());
+    auto fail = [&](const char * code, const std::string & msg) {
+        send({{"ev", "error"}, {"id", id}, {"code", code}, {"msg", msg}});
+    };
+    if (!texts.is_array()) {
+        return fail("bad_request", "texts is a list of strings");
+    }
+    const int n_out = llama_model_n_embd_out(e.model);
+    const int d = dim > 0 && dim < n_out ? dim : n_out;
+    const int n_batch = (int) llama_n_batch(e.ctx), n_seq = (int) llama_n_seq_max(e.ctx);
+    const int max_tok = std::max(8, std::min(req.value("max_tokens", 512), n_batch));
+    const bool bos = llama_vocab_get_add_bos(e.vocab), eos = llama_vocab_get_add_eos(e.vocab);
+    std::vector<float> out;
+    out.reserve(texts.size() * d);
+    llama_batch b = llama_batch_init(n_batch, 0, 1);
+    llama_memory_t mem = llama_get_memory(e.ctx);
+    size_t i = 0;
+    while (i < texts.size()) {
+        b.n_tokens = 0;
+        int s = 0;
+        while (i < texts.size() && s < n_seq) {
+            if (!texts[i].is_string()) {
+                llama_batch_free(b);
+                return fail("bad_request", "texts is a list of strings");
+            }
+            std::vector<llama_token> t;
+            if (bos) {
+                t.push_back(llama_vocab_bos(e.vocab));
+            }
+            auto body = tokenize(e.vocab, texts[i].get<std::string>(), false);   // a text never reads as markup
+            body.resize(std::min<size_t>(body.size(), max_tok - (bos ? 1 : 0) - (eos ? 1 : 0)));
+            t.insert(t.end(), body.begin(), body.end());
+            if (eos) {
+                t.push_back(llama_vocab_eos(e.vocab));
+            }
+            if (b.n_tokens + (int) t.size() > n_batch) {
+                break;                             // full: this text starts the next batch
+            }
+            for (size_t k = 0; k < t.size(); k++) {
+                const int n = b.n_tokens++;
+                b.token[n] = t[k];
+                b.pos[n] = (llama_pos) k;
+                b.n_seq_id[n] = 1;
+                b.seq_id[n][0] = s;
+                b.logits[n] = true;
+            }
+            s++;
+            i++;
+        }
+        llama_memory_clear(mem, true);
+        if (e.in->cancel || llama_decode(e.ctx, b) != 0) {
+            llama_batch_free(b);
+            return fail(e.in->cancel ? "cancel" : "decode", "the texts could not be embedded (llama_decode failed)");
+        }
+        for (int k = 0; k < s; k++) {
+            const float * v = llama_get_embeddings_seq(e.ctx, k);
+            if (!v) {
+                llama_batch_free(b);
+                return fail("decode", "the model gave no pooled vector");
+            }
+            double sum = 0;
+            for (int j = 0; j < d; j++) {
+                sum += (double) v[j] * v[j];
+            }
+            const float scale = sum > 0 ? (float) (1.0 / std::sqrt(sum)) : 0.0f;
+            for (int j = 0; j < d; j++) {
+                out.push_back(v[j] * scale);
+            }
+        }
+    }
+    llama_batch_free(b);
+    send({{"ev", "vec"}, {"id", id}, {"dim", d}, {"n", texts.size()}, {"b64", base64(out.data(), out.size() * sizeof(float))}});
+}
+
 // ------------------------------------------------------------------------------------------------------------------ start --
 static json rows_json(const std::vector<common_memory_breakdown_row> & rows, uint64_t & device_bytes, uint64_t & host_bytes) {
     json out = json::array();
@@ -391,19 +488,25 @@ int main(int argc, char ** argv) {
 #endif
     std::string path;
     int n_ctx = 16384, threads = 0;
-    bool cpu_only = false, measure = false;
+    bool cpu_only = false, measure = false, embed_mode = false, ctx_given = false;
+    int dim = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) {
             path = argv[++i];
         } else if (a == "--ctx" && i + 1 < argc) {
             n_ctx = std::atoi(argv[++i]);
+            ctx_given = true;
         } else if (a == "--threads" && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
         } else if (a == "--cpu-only") {
             cpu_only = true;
         } else if (a == "--measure") {
             measure = true;
+        } else if (a == "--embed") {
+            embed_mode = true;             // an embedding model: answers "embed" requests only
+        } else if (a == "--dim" && i + 1 < argc) {
+            dim = std::atoi(argv[++i]);
         } else {
             send({{"ev", "error"}, {"code", "usage"}, {"msg", "unknown option " + a}});
             return 2;
@@ -432,6 +535,14 @@ int main(int argc, char ** argv) {
     cp.abort_callback_data = &in;
     cp.no_perf = true;
     cp.swa_full = false;   // as llama-server runs it: the sliding-window layers keep only their window, not the whole context
+    if (embed_mode) {               // whole texts in one pass, many at a time; the pooling the model file names
+        n_ctx = ctx_given ? std::min(n_ctx, 8192) : 2048;   // a block of passages per pass; 2048 was fastest on an M5 Max
+        cp.n_ctx = cp.n_batch = cp.n_ubatch = n_ctx;
+        cp.n_seq_max = 64;
+        cp.kv_unified = true;
+        cp.embeddings = true;
+        cp.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+    }
     static ggml_backend_dev_t no_devices[1] = { nullptr };
     if (cpu_only) {
         mp.devices = no_devices;
@@ -444,7 +555,7 @@ int main(int argc, char ** argv) {
     std::vector<size_t> margins(llama_max_devices(), (size_t) 1024 * 1024 * 1024);
     auto t_fit = std::chrono::steady_clock::now();
     common_params_fit_status st = COMMON_PARAMS_FIT_STATUS_SUCCESS;
-    if (!cpu_only) {
+    if (!cpu_only && !embed_mode) {   // an embedding model is small: nothing to fit
         st = common_fit_params(path.c_str(), &mp, &cp, split.data(), overrides.data(), margins.data(), (uint32_t) n_ctx, nullptr, GGML_LOG_LEVEL_ERROR);
     }
     if (st == COMMON_PARAMS_FIT_STATUS_ERROR) {
@@ -512,7 +623,13 @@ int main(int argc, char ** argv) {
             req = std::move(in.q.front());
             in.q.pop_front();
         }
-        if (req.value("op", "") == "gen") {
+        if (embed_mode && req.value("op", "") == "embed") {
+            try {
+                embed(e, req, dim);
+            } catch (const std::exception & ex) {
+                send({{"ev", "error"}, {"id", req.value("id", json())}, {"code", "bad_request"}, {"msg", ex.what()}});
+            }
+        } else if (!embed_mode && req.value("op", "") == "gen") {
             try {
                 generate(e, req);
             } catch (const std::exception & ex) {
