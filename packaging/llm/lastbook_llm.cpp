@@ -372,7 +372,8 @@ static void embed(Engine & e, const json & req, int dim) {
     const int d = dim > 0 && dim < n_out ? dim : n_out;
     const int n_batch = (int) llama_n_batch(e.ctx), n_seq = (int) llama_n_seq_max(e.ctx);
     const int max_tok = std::max(8, std::min(req.value("max_tokens", 512), n_batch));
-    const bool bos = llama_vocab_get_add_bos(e.vocab), eos = llama_vocab_get_add_eos(e.vocab);
+    // the marks the model's tokenizer adds around a text: BOS and EOS for Gemma, [CLS] and [SEP] for BERT (bge)
+    const bool bos = llama_vocab_get_add_bos(e.vocab), eos = llama_vocab_get_add_eos(e.vocab), sep = llama_vocab_get_add_sep(e.vocab);
     std::vector<float> out;
     out.reserve(texts.size() * d);
     llama_batch b = llama_batch_init(n_batch, 0, 1);
@@ -391,10 +392,13 @@ static void embed(Engine & e, const json & req, int dim) {
                 t.push_back(llama_vocab_bos(e.vocab));
             }
             auto body = tokenize(e.vocab, texts[i].get<std::string>(), false);   // a text never reads as markup
-            body.resize(std::min<size_t>(body.size(), max_tok - (bos ? 1 : 0) - (eos ? 1 : 0)));
+            body.resize(std::min<size_t>(body.size(), max_tok - (bos ? 1 : 0) - (eos ? 1 : 0) - (sep ? 1 : 0)));
             t.insert(t.end(), body.begin(), body.end());
             if (eos) {
                 t.push_back(llama_vocab_eos(e.vocab));
+            }
+            if (sep) {
+                t.push_back(llama_vocab_sep(e.vocab));
             }
             if (b.n_tokens + (int) t.size() > n_batch) {
                 break;                             // full: this text starts the next batch
